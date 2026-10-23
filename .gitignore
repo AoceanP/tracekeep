@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+
+# stored logs and keys: real data and secrets never belong in the repository
+logs/
+*.jsonl
+*.log
+*.key
+key*.txt
