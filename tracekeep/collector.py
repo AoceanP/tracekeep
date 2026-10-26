@@ -52,6 +52,7 @@ class Collector(socketserver.ThreadingTCPServer):
         self.key = key
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        self._open: set[socket.socket] = set()
         super().__init__((host, port), _Connection)
 
     def stream_lock(self, name: str) -> threading.Lock:
@@ -64,6 +65,41 @@ class Collector(socketserver.ThreadingTCPServer):
         """
         with self._locks_guard:
             return self._locks.setdefault(name, threading.Lock())
+
+    def track(self, sock: socket.socket, is_open: bool) -> None:
+        """
+        WHAT:   Adds or removes a shipper connection from the open set.
+        WHY:    stop() needs them all, to close them like a real shutdown does.
+        PRE:    none
+        RETURN: nothing
+        """
+        with self._locks_guard:
+            if is_open:
+                self._open.add(sock)
+            else:
+                self._open.discard(sock)
+
+    def stop(self) -> None:
+        """
+        WHAT:   Stops accepting, closes the listening socket, and drops every
+                open shipper connection.
+        WHY:    shutdown() alone only stops new connections; shippers already
+                connected would keep being served. Dropping them is what a
+                crash or a restart really does, which is what shippers must
+                survive (and what the outage demo and tests show).
+        PRE:    serve_forever() is running in another thread
+        POST:   nothing is listening and no connection is open
+        RETURN: nothing
+        """
+        self.shutdown()
+        self.server_close()
+        with self._locks_guard:
+            connections = list(self._open)
+        for sock in connections:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # already closed by the other side
 
 
 class _Connection(socketserver.BaseRequestHandler):
@@ -87,6 +123,7 @@ class _Connection(socketserver.BaseRequestHandler):
         """
         sock: socket.socket = self.request
         sock.settimeout(IDLE_TIMEOUT)
+        self.server.track(sock, True)
         decoder = FrameDecoder()
         stream: str | None = None
         verifier: ChainVerifier | None = None
@@ -111,6 +148,14 @@ class _Connection(socketserver.BaseRequestHandler):
         except OSError:
             # an idle shipper (timeout), a vanished one, or a disk error: just close
             return
+
+    def finish(self) -> None:
+        """
+        WHAT:   Removes the connection from the open set when it ends.
+        WHY:    socketserver calls finish() after handle(), whatever happened.
+        RETURN: nothing
+        """
+        self.server.track(self.request, False)
 
     def _hello(self, sock: socket.socket, frame: Frame) -> tuple[str, ChainVerifier]:
         """

@@ -19,7 +19,8 @@ from pathlib import Path
 from tracekeep import __version__
 from tracekeep.chain import MIN_KEY_BYTES, ChainWriter, Problem, verify
 from tracekeep.collector import Collector
-from tracekeep.shipper import ShipError, Shipper
+from tracekeep.shipper import ShipError, Shipper, SpoolingShipper
+from tracekeep.spool import DEFAULT_LIMIT, Spool, SpoolFull
 from tracekeep.storage import is_valid_stream, line_to_record, read_log, record_to_line
 
 OK = 0
@@ -108,13 +109,17 @@ def command_collect(args: argparse.Namespace) -> int:
 def command_ship(args: argparse.Namespace) -> int:
     """
     WHAT:   Sends each line of a file (or standard input) as a record.
-    WHY:    Blank lines are skipped; each line is confirmed stored before the next.
+    WHY:    Blank lines are skipped; each line is confirmed stored before the
+            next. With --spool, lines are also kept on disk while the
+            collector cannot be reached, and sent when it is back.
     PRE:    args came from the "ship" parser
     RETURN: the exit code
     """
     if not is_valid_stream(args.stream):
         raise ValueError("the stream name must be 1 to 64 letters, digits, '_' or '-'")
     key = load_key(args.key_file)
+    if args.spool:
+        return ship_with_spool(args, key)
     source = sys.stdin if args.file == "-" else open(args.file, encoding="utf-8")
     sent = 0
     with source, Shipper(args.host, args.port, key, args.stream) as shipper:
@@ -124,6 +129,44 @@ def command_ship(args: argparse.Namespace) -> int:
                 shipper.send(line)
                 sent += 1
     print(f"shipped {sent} record{'s' if sent != 1 else ''} to stream {args.stream}", file=sys.stderr)
+    return OK
+
+
+def ship_with_spool(args: argparse.Namespace, key: bytes) -> int:
+    """
+    WHAT:   The "ship --spool" path: store and forward.
+    WHY:    Says when the collector drops out and comes back, so someone
+            watching knows the lines are safe on disk, not lost.
+    PRE:    args came from the "ship" parser with --spool; key is valid
+    RETURN: OK, even if records are still waiting (they are safe on disk
+            and go out on the next run); ERROR if the spool fills up or the
+            collector refuses a record
+    """
+    spool = Spool(Path(args.spool), args.stream, args.spool_limit)
+    source = sys.stdin if args.file == "-" else open(args.file, encoding="utf-8")
+    sealed = 0
+    with source, SpoolingShipper(args.host, args.port, key, args.stream, spool, args.retry) as shipper:
+        was_connected = shipper.connected or shipper.waiting == 0
+        for line in source:
+            line = line.rstrip("\r\n")
+            if not line:
+                continue
+            try:
+                shipper.send(line)
+            except SpoolFull as error:
+                print(f"error: {error}", file=sys.stderr)
+                return ERROR
+            sealed += 1
+            # tell the person watching when the collector drops out or comes back
+            if was_connected and shipper.waiting:
+                print(f"collector unreachable: spooling to {spool.path}", file=sys.stderr)
+            elif not was_connected and not shipper.waiting:
+                print("collector back: every spooled record was delivered", file=sys.stderr)
+            was_connected = shipper.waiting == 0
+        waiting = shipper.close()
+    print(f"sealed {sealed} record{'s' if sealed != 1 else ''} for stream {args.stream}; "
+          + (f"{waiting} waiting in {spool.path}, sent on the next run" if waiting else "all delivered"),
+          file=sys.stderr)
     return OK
 
 
@@ -142,7 +185,7 @@ def command_verify(args: argparse.Namespace) -> int:
     return TAMPERED if problems else OK
 
 
-def command_demo(_: argparse.Namespace) -> int:
+def command_demo(args: argparse.Namespace) -> int:
     """
     WHAT:   Shows the whole idea in one run, with fake data in a temporary folder.
     WHY:    Ships six fake log lines to a collector on this machine, verifies
@@ -151,6 +194,8 @@ def command_demo(_: argparse.Namespace) -> int:
     PRE:    none
     RETURN: OK
     """
+    if args.outage:
+        return command_outage_demo()
     with tempfile.TemporaryDirectory(prefix="tracekeep-demo-") as folder:
         # 1. a collector on a free port of 127.0.0.1, running in the background
         with Collector(Path(folder), DEMO_KEY, "127.0.0.1", 0) as server:
@@ -188,6 +233,55 @@ def command_demo(_: argparse.Namespace) -> int:
     return OK
 
 
+def command_outage_demo() -> int:
+    """
+    WHAT:   Shows store and forward: the collector goes down mid-stream,
+            lines wait in the spool, the collector comes back on the same
+            port, and the spooled lines arrive in order with the chain intact.
+    WHY:    Proves the claim with a real stop and restart, not a mock.
+    PRE:    none
+    RETURN: OK
+    """
+    with tempfile.TemporaryDirectory(prefix="tracekeep-outage-") as folder:
+        logs, spool_folder = Path(folder) / "logs", Path(folder) / "spool"
+
+        def start(port: int) -> tuple[Collector, threading.Thread]:
+            server = Collector(logs, DEMO_KEY, "127.0.0.1", port)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            return server, thread
+
+        server, thread = start(0)
+        port = server.server_address[1]
+        spool = Spool(spool_folder, "web01")
+        with SpoolingShipper("127.0.0.1", port, DEMO_KEY, "web01", spool, retry_seconds=0) as shipper:
+            print(f"1. collector up on 127.0.0.1:{port}; shipping 2 lines")
+            for line in DEMO_LINES[:2]:
+                shipper.send(line)
+            print(f"   waiting in the spool: {shipper.waiting}")
+
+            print("\n2. the collector stops; shipping 3 more lines")
+            server.stop()
+            thread.join()
+            for line in DEMO_LINES[2:5]:
+                shipper.send(line)
+            print(f"   collector unreachable: {shipper.waiting} records sealed and waiting in {spool.path.name}")
+
+            print("\n3. the collector restarts on the same port; shipping 1 more line")
+            server, thread = start(port)
+            shipper.send(DEMO_LINES[5])
+            print(f"   waiting in the spool: {shipper.waiting}")
+        server.stop()
+
+        log = logs / "web01.jsonl"
+        print("\n4. verifying the collector's log: the outage left no gap")
+        records = read_log(log)
+        print_problems(log, verify(records, DEMO_KEY), len(records))
+        for _, record in records:
+            print(f"   {record.seq}  {record.message}")
+    return OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     """
     WHAT:   Defines the commands and their options.
@@ -215,6 +309,12 @@ def build_parser() -> argparse.ArgumentParser:
     ship.add_argument("--host", default="127.0.0.1", help="the collector's address (default: 127.0.0.1)")
     ship.add_argument("--port", type=int, default=5140, help="the collector's port (default: 5140)")
     ship.add_argument("--key-file", help=key_help)
+    ship.add_argument("--spool", metavar="DIR",
+                      help="keep lines in this folder while the collector is unreachable, and send them when it is back")
+    ship.add_argument("--retry", type=float, default=5.0, metavar="SECONDS",
+                      help="with --spool: seconds between reconnection attempts (default: 5)")
+    ship.add_argument("--spool-limit", type=int, default=DEFAULT_LIMIT, metavar="N",
+                      help=f"with --spool: the most records to keep waiting (default: {DEFAULT_LIMIT:,})")
     ship.set_defaults(run=command_ship)
 
     check = commands.add_parser("verify", help="check a stored log for tampering")
@@ -223,6 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
     check.set_defaults(run=command_verify)
 
     demo = commands.add_parser("demo", help="ship, verify and tamper with fake logs, in a temporary folder")
+    demo.add_argument("--outage", action="store_true",
+                      help="instead, stop and restart the collector mid-stream to show store and forward")
     demo.set_defaults(run=command_demo)
     return parser
 

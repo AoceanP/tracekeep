@@ -50,6 +50,7 @@ To understand integrity protection and protocol design from the ground up, the p
 | Path traversal prevention for names that come from the network | `storage.py` |
 | A threaded TCP server with per-stream locking | `collector.py` |
 | Testing networked code with real sockets on localhost | `tests/test_network.py` |
+| Store and forward: write-ahead spooling, fsync, atomic state files, resuming without duplicates | `tracekeep/spool.py`, `SpoolingShipper` |
 
 ### Part of a project series
 
@@ -86,7 +87,7 @@ No install step: everything runs with `python -m tracekeep` from this folder.
 python -m unittest discover -s tests -t .
 ```
 
-It ends with `Ran 40 tests ... OK`.
+It ends with `Ran 59 tests ... OK`.
 
 ### 4. Try the demo
 
@@ -129,14 +130,48 @@ Now open `logs/app01.jsonl` in a text editor, change one character in any messag
 |---|---|
 | `collect [--dir DIR] [--host H] [--port P]` | receive records and store each stream in `DIR/STREAM.jsonl` (default `logs`, `127.0.0.1`, `5140`) |
 | `ship FILE --stream NAME [--host H] [--port P]` | send each line of `FILE` (or `-` for standard input) as a record |
+| `ship ... --spool DIR [--retry S] [--spool-limit N]` | the same, but keep lines in `DIR` while the collector is unreachable and send them when it is back (store and forward) |
 | `verify FILE` | check a stored log and list every problem |
 | `demo` | the full story with fake data, in a temporary folder |
+| `demo --outage` | stop and restart a real collector mid-stream, to show store and forward |
 
 Every command takes `--key-file FILE` instead of the `TRACEKEEP_KEY` variable.
 
 **Exit codes:** `0` success (for `verify`: the chain is intact), `3` `verify` found tampering, `1` error, `2` bad command line, the same scheme as logonwatch.
 
 **Stream names** are 1 to 64 letters, digits, `_` or `-`. Each stream is its own chain and its own file. A shipper that reconnects continues its stream's chain where it ended.
+
+### Store and forward
+
+Without `--spool`, a line that cannot be delivered is an error. With it, an outage costs nothing:
+
+```
+tracekeep ship - --stream web01 --spool spool
+```
+
+- **Write-ahead:** every line is sealed, written to `spool/web01.spool.jsonl` and synced to disk *before* it is sent. A crash at any moment loses nothing that was read.
+- **Sealed while waiting:** records are sealed when the line arrives, not when they are delivered. Their time is when the line was written, and a record edited on disk while it waits is refused by the collector (invalid MAC).
+- **Back in order:** while the collector is down, a reconnect is tried at most every `--retry` seconds (default 5). Once it answers, the waiting records go out oldest first, then the spool is emptied.
+- **No duplicates after a crash:** if the shipper crashed after the collector stored records but before clearing them, the collector's HELLO says where its chain ends. Those records are skipped, after checking the chain really ends at them.
+- **Never merged, never dropped:** if the collector's chain does not continue the spool (someone else wrote the stream meanwhile), shipping stops and the spool is kept as is. Re-sealing would destroy the proof. A full spool (`--spool-limit`, default 100,000 records) also stops with an error, because dropping the oldest records would cut the chain.
+- **The first run needs the collector,** to learn where the stream's chain stands. After that the chain end is kept in `spool/web01.state.json`, so the shipper can start during an outage.
+
+```
+> tracekeep demo --outage
+1. collector up on 127.0.0.1:61445; shipping 2 lines
+   waiting in the spool: 0
+
+2. the collector stops; shipping 3 more lines
+   collector unreachable: 3 records sealed and waiting in web01.spool.jsonl
+
+3. the collector restarts on the same port; shipping 1 more line
+   waiting in the spool: 0
+
+4. verifying the collector's log: the outage left no gap
+web01.jsonl: 6 records, chain intact
+```
+
+On Windows a refused connection takes about **2 seconds** to fail (Windows retries before giving up), so every reconnect attempt pauses the shipper that long. That is why attempts are spaced by `--retry` instead of made for every line.
 
 **The stored format** is one JSON object per line, readable in any editor:
 ```
@@ -160,6 +195,7 @@ Each record's hash is `SHA-256(prev ‖ seq ‖ time ‖ message)` and its MAC i
 
 - **Integrity, not secrecy:** tracekeep proves logs were not changed; it does **not** encrypt them. Anyone who can see the traffic can read the log lines (wiresight shows them). For logs over a real network, add TLS: see the roadmap.
 - **The key is everything:** anyone with the key can write valid records. It is read from an environment variable or a file, never from the command line (where other users can see it) and never printed. The demo's key is public and only for the demo.
+- **The spool is on the shipper's disk:** waiting records are sealed, so changes to them are caught, but they are not encrypted, and a spool can be deleted by anyone who can delete the original log. Protect the spool folder like the log it holds.
 - **Local by default:** the collector listens on `127.0.0.1`, so it is not reachable from the network unless you pass `--host` on purpose.
 - **What the chain cannot show by itself:** if someone deletes the **last** records of a log, the remaining chain is still valid. The collector tells the shipper the latest hash in every ACK; keeping that value somewhere else (another machine, a printout) lets you prove nothing was cut off the end. Anchoring it automatically is on the roadmap.
 - `.gitignore` blocks `logs/`, `*.jsonl` and key files.
@@ -181,7 +217,7 @@ Both diagrams are drawn in draw.io: [tracekeep-protocol.drawio](docs/tracekeep-p
 
 ## Tests
 
-40 tests with Python's built-in `unittest`, run with `python -m unittest discover -s tests -t .`. The network tests start a real collector on `127.0.0.1` on a free port, in a temporary folder that is deleted afterwards.
+59 tests with Python's built-in `unittest`, run with `python -m unittest discover -s tests -t .`. The network tests start a real collector on `127.0.0.1` on a free port, in a temporary folder that is deleted afterwards.
 
 | File | What it covers |
 |---|---|
@@ -189,10 +225,12 @@ Both diagrams are drawn in draw.io: [tracekeep-protocol.drawio](docs/tracekeep-p
 | `test_chain.py` | edits, deletions, swaps, duplicates, forged and rebuilt chains, the wrong key, payload checks |
 | `test_network.py` | shipping, reconnecting, separate streams, wrong keys, replays, path traversal, garbage, half frames |
 | `test_storage_and_cli.py` | the file format, stream names, the demo, exit codes, missing keys, files and collectors |
+| `test_spool.py` | store and forward against a collector that is really stopped and restarted: outages, restarts of either side, a crash between an ACK and clearing the spool, a conflicting chain, a spool edited on disk, a full spool, the retry interval |
 
 ## Roadmap
 
 - [x] Binary protocol, hash chain with HMAC, collector, shipper, offline verify
+- [x] Store and forward: keep shipping through collector outages
 - [ ] TLS, so log lines are also kept secret on the network
 - [ ] Anchor the latest hash automatically (e.g. to a second collector), to detect a truncated end
 - [ ] Key rotation, with the key's ID stored in each record

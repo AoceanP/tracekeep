@@ -11,3 +11,5 @@ logs/
 *.log
 *.key
 key*.txt
+spool/
+*.state.json
