@@ -18,10 +18,12 @@ from pathlib import Path
 
 from tracekeep import __version__
 from tracekeep.chain import MIN_KEY_BYTES, ChainWriter, Problem, verify
+from tracekeep.admission import Limits
 from tracekeep.collector import Collector
 from tracekeep.shipper import ShipError, Shipper, SpoolingShipper
 from tracekeep.spool import DEFAULT_LIMIT, Spool, SpoolFull
 from tracekeep.storage import is_valid_stream, line_to_record, read_log, record_to_line
+from tracekeep.tls import client_context, server_context
 
 OK = 0
 """WHAT: exit code for success."""
@@ -96,9 +98,16 @@ def command_collect(args: argparse.Namespace) -> int:
     RETURN: the exit code
     """
     key = load_key(args.key_file)
-    with Collector(Path(args.dir), key, args.host, args.port) as server:
+    if bool(args.tls_cert) != bool(args.tls_key):
+        raise ValueError("--tls-cert and --tls-key go together")
+    if args.tls_client_ca and not args.tls_cert:
+        raise ValueError("--tls-client-ca needs --tls-cert and --tls-key")
+    tls = server_context(args.tls_cert, args.tls_key, args.tls_client_ca) if args.tls_cert else None
+    limits = Limits(max_connections=args.max_connections, per_source=args.per_source)
+    with Collector(Path(args.dir), key, args.host, args.port, limits, tls) as server:
         host, port = server.server_address[:2]
-        print(f"collecting into {Path(args.dir)} on {host}:{port}, press Ctrl+C to stop", file=sys.stderr)
+        mode = "TLS 1.3" + (" with client certificates" if args.tls_client_ca else "") if tls else "no TLS"
+        print(f"collecting into {Path(args.dir)} on {host}:{port} ({mode}), press Ctrl+C to stop", file=sys.stderr)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -118,11 +127,12 @@ def command_ship(args: argparse.Namespace) -> int:
     if not is_valid_stream(args.stream):
         raise ValueError("the stream name must be 1 to 64 letters, digits, '_' or '-'")
     key = load_key(args.key_file)
+    tls = shipper_tls(args)
     if args.spool:
-        return ship_with_spool(args, key)
+        return ship_with_spool(args, key, tls)
     source = sys.stdin if args.file == "-" else open(args.file, encoding="utf-8")
     sent = 0
-    with source, Shipper(args.host, args.port, key, args.stream) as shipper:
+    with source, Shipper(args.host, args.port, key, args.stream, tls=tls, tls_name=args.tls_name) as shipper:
         for line in source:
             line = line.rstrip("\r\n")
             if line:
@@ -132,7 +142,21 @@ def command_ship(args: argparse.Namespace) -> int:
     return OK
 
 
-def ship_with_spool(args: argparse.Namespace, key: bytes) -> int:
+def shipper_tls(args: argparse.Namespace):
+    """
+    WHAT:   The shipper's TLS context from --tls-ca (and --tls-cert/--tls-key for mutual TLS).
+    PRE:    args came from the "ship" parser
+    RETURN: the context, or None without --tls-ca
+    RAISES: ValueError for an incomplete set of TLS options
+    """
+    if bool(args.tls_cert) != bool(args.tls_key):
+        raise ValueError("--tls-cert and --tls-key go together")
+    if args.tls_cert and not args.tls_ca:
+        raise ValueError("a client certificate needs --tls-ca too")
+    return client_context(args.tls_ca, args.tls_cert, args.tls_key) if args.tls_ca else None
+
+
+def ship_with_spool(args: argparse.Namespace, key: bytes, tls=None) -> int:
     """
     WHAT:   The "ship --spool" path: store and forward.
     WHY:    Says when the collector drops out and comes back, so someone
@@ -145,7 +169,8 @@ def ship_with_spool(args: argparse.Namespace, key: bytes) -> int:
     spool = Spool(Path(args.spool), args.stream, args.spool_limit)
     source = sys.stdin if args.file == "-" else open(args.file, encoding="utf-8")
     sealed = 0
-    with source, SpoolingShipper(args.host, args.port, key, args.stream, spool, args.retry) as shipper:
+    with source, SpoolingShipper(args.host, args.port, key, args.stream, spool, args.retry, tls=tls,
+                                 tls_name=args.tls_name) as shipper:
         was_connected = shipper.connected or shipper.waiting == 0
         for line in source:
             line = line.rstrip("\r\n")
@@ -301,6 +326,14 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1, this machine only)")
     collect.add_argument("--port", type=int, default=5140, help="port to listen on (default: 5140)")
     collect.add_argument("--key-file", help=key_help)
+    collect.add_argument("--max-connections", type=int, default=Limits.max_connections, metavar="N",
+                         help=f"open connections allowed in total (default: {Limits.max_connections})")
+    collect.add_argument("--per-source", type=int, default=Limits.per_source, metavar="N",
+                         help=f"open connections allowed from one address (default: {Limits.per_source})")
+    collect.add_argument("--tls-cert", metavar="FILE", help="the collector's certificate (PEM): turns on TLS 1.3")
+    collect.add_argument("--tls-key", metavar="FILE", help="the private key for --tls-cert (PEM)")
+    collect.add_argument("--tls-client-ca", metavar="FILE",
+                         help="require shippers to present a certificate signed by this CA (mutual TLS)")
     collect.set_defaults(run=command_collect)
 
     ship = commands.add_parser("ship", help="send log lines from a file, or - for standard input")
@@ -315,6 +348,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="with --spool: seconds between reconnection attempts (default: 5)")
     ship.add_argument("--spool-limit", type=int, default=DEFAULT_LIMIT, metavar="N",
                       help=f"with --spool: the most records to keep waiting (default: {DEFAULT_LIMIT:,})")
+    ship.add_argument("--tls-ca", metavar="FILE", help="the CA that signed the collector's certificate: turns on TLS")
+    ship.add_argument("--tls-cert", metavar="FILE", help="this shipper's certificate, for mutual TLS")
+    ship.add_argument("--tls-key", metavar="FILE", help="the private key for --tls-cert")
+    ship.add_argument("--tls-name", metavar="NAME", help="the name on the collector's certificate (default: --host)")
     ship.set_defaults(run=command_ship)
 
     check = commands.add_parser("verify", help="check a stored log for tampering")

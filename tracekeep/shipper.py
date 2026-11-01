@@ -8,10 +8,11 @@ WHY:    Logs sent off the machine as they are written cannot be quietly
 from __future__ import annotations
 
 import socket
+import ssl
 import time
 
 from tracekeep.chain import ChainWriter, Record
-from tracekeep.collector import ACK_PAYLOAD
+from tracekeep.handshake import HandshakeError, decode_challenge, decode_welcome, encode_hello
 from tracekeep.protocol import Frame, FrameDecoder, MessageType, ProtocolError, encode
 from tracekeep.spool import Spool
 
@@ -39,14 +40,21 @@ class Shipper:
             always closed.
     """
 
-    def __init__(self, host: str, port: int, key: bytes, stream: str, timeout: float = 10.0) -> None:
+    def __init__(self, host: str, port: int, key: bytes, stream: str, timeout: float = 10.0,
+                 tls: ssl.SSLContext | None = None, tls_name: str | None = None) -> None:
         """
-        WHAT:   Connects and says HELLO.
-        WHY:    The collector answers with where the chain stands, so the
+        WHAT:   Connects and runs the handshake: solves the collector's
+                puzzle, proves it holds the key, and checks the collector's
+                proof in return.
+        WHY:    The collector then says where the chain stands, so the
                 shipper continues it instead of starting again.
-        PRE:    key is at least 16 bytes; stream is a valid stream name
-        POST:   connected; the next send() continues the stored chain
-        RAISES: ShipError if the connection or HELLO fails
+        PRE:    key is at least 16 bytes; stream is a valid stream name;
+                tls, if given, is a client-side context
+        POST:   connected and authenticated both ways; the next send()
+                continues the stored chain
+        RAISES: RefusedError if the collector refuses the handshake;
+                ShipError if the connection fails or the collector cannot
+                prove it holds the key
         """
         self._decoder = FrameDecoder()
         try:
@@ -55,12 +63,28 @@ class Shipper:
             raise ShipError(f"could not connect to {host}:{port}: {error}") from error
 
         try:
-            self._sock.sendall(encode(MessageType.HELLO, stream.encode("utf-8")))
-            next_seq, prev = ACK_PAYLOAD.unpack(self._expect_ack().payload)
-        except (OSError, ShipError):
+            if tls is not None:
+                self._sock = tls.wrap_socket(self._sock, server_hostname=tls_name or host)
+            server_nonce, difficulty = decode_challenge(self._expect(MessageType.CHALLENGE).payload)
+            hello, client_nonce = encode_hello(key, server_nonce, difficulty, stream)
+            self._sock.sendall(encode(MessageType.HELLO, hello))
+            next_seq, prev = decode_welcome(key, server_nonce, client_nonce, self._expect(MessageType.WELCOME).payload)
+        except HandshakeError as error:
+            self._sock.close()
+            raise ShipError(str(error)) from error
+        except OSError as error:
+            # includes a failed TLS handshake (ssl.SSLError is an OSError)
+            self._sock.close()
+            raise ShipError(f"handshake with {host}:{port} failed: {error}") from error
+        except ShipError as error:
             # do not leave a half-open socket behind if the handshake fails
             self._sock.close()
+            if tls is None and isinstance(error.__cause__, TimeoutError):
+                # a TLS collector waits for a TLS hello and never sends a CHALLENGE in plain text
+                raise ShipError(f"{error} (no CHALLENGE arrived: is the collector using TLS? pass --tls-ca)") from error
             raise
+        self.puzzle_bits = difficulty
+        """WHAT: the difficulty of the puzzle this connection had to solve, in bits."""
         self.collector_end = (next_seq, prev)
         """WHAT: where the collector's stored chain ended when we connected: (next seq, last hash)."""
         self._writer = ChainWriter(key, next_seq, prev)
@@ -119,10 +143,19 @@ class Shipper:
     def _expect_ack(self) -> Frame:
         """
         WHAT:   Reads frames until an ACK arrives.
-        WHY:    An ERROR from the collector becomes a ShipError with its reason.
-        PRE:    a request was just sent
+        PRE:    a record was just sent
         RETURN: the ACK frame
-        RAISES: ShipError for an ERROR frame, a closed connection or a bad frame
+        RAISES: RefusedError for an ERROR frame; ShipError for a closed connection or a bad frame
+        """
+        return self._expect(MessageType.ACK)
+
+    def _expect(self, wanted: MessageType) -> Frame:
+        """
+        WHAT:   Reads the next frame, which must be of type `wanted`.
+        WHY:    An ERROR from the collector becomes a RefusedError with its reason.
+        PRE:    the collector is due to send `wanted`
+        RETURN: the frame
+        RAISES: RefusedError for an ERROR frame; ShipError for a closed connection or a bad frame
         """
         try:
             while True:
@@ -130,11 +163,11 @@ class Shipper:
                 if not data:
                     raise ShipError("the collector closed the connection")
                 for frame in self._decoder.feed(data):
-                    if frame.type == MessageType.ACK:
+                    if frame.type == wanted:
                         return frame
                     if frame.type == MessageType.ERROR:
                         raise RefusedError("collector refused: " + frame.payload.decode("utf-8", errors="replace"))
-                    raise ShipError(f"unexpected {frame.type.name} frame from the collector")
+                    raise ShipError(f"expected {wanted.name}, got {frame.type.name} from the collector")
         except (OSError, ProtocolError) as error:
             raise ShipError(f"connection failed: {error}") from error
 
@@ -152,7 +185,7 @@ class SpoolingShipper:
     """
 
     def __init__(self, host: str, port: int, key: bytes, stream: str, spool: Spool, retry_seconds: float = 5.0,
-                 timeout: float = 10.0) -> None:
+                 timeout: float = 10.0, tls: ssl.SSLContext | None = None, tls_name: str | None = None) -> None:
         """
         WHAT:   Starts shipping a stream through a spool.
         WHY:    Tries the collector once straight away to send anything left
@@ -168,13 +201,14 @@ class SpoolingShipper:
         self._spool = spool
         self._retry = retry_seconds
         self._timeout = timeout
+        self._tls, self._tls_name = tls, tls_name
         self._link: Shipper | None = None
         self._last_try = float("-inf")
 
         end = spool.chain_end()
         if end is None:
             # first run: the collector must say where the stored chain ends (it may already hold records)
-            self._link = Shipper(host, port, key, stream, timeout)
+            self._link = Shipper(host, port, key, stream, timeout, tls, tls_name)
             end = self._link.collector_end
             spool.remember_end(*end)
         self._writer = ChainWriter(key, *end)
@@ -231,7 +265,8 @@ class SpoolingShipper:
                 return self.waiting
             self._last_try = time.monotonic()
             try:
-                self._link = Shipper(self._host, self._port, self._key, self._stream, self._timeout)
+                self._link = Shipper(self._host, self._port, self._key, self._stream, self._timeout, self._tls,
+                                     self._tls_name)
             except RefusedError:
                 raise
             except ShipError:

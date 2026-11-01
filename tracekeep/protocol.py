@@ -23,8 +23,10 @@ from enum import IntEnum
 MAGIC = b"TK"
 """WHAT: the first two bytes of every frame. WHY: lets a receiver reject random or misdirected traffic at once."""
 
-VERSION = 1
-"""WHAT: the protocol version. WHY: a future version 2 can be refused cleanly instead of misread."""
+VERSION = 2
+"""WHAT: the protocol version.
+WHY: version 2 added the authenticated handshake (CHALLENGE, HELLO with a
+proof, WELCOME); a version 1 shipper is refused cleanly instead of misread."""
 
 HEADER = struct.Struct(">2sBBI")
 """WHAT: magic (2 bytes), version (1), type (1), payload length (4), big-endian. WHY: network byte order."""
@@ -42,7 +44,8 @@ class MessageType(IntEnum):
     """
 
     HELLO = 1
-    """WHAT: shipper to collector, first frame: the stream name. WHY: says which log the records belong to."""
+    """WHAT: shipper to collector, answering CHALLENGE: the puzzle solution, the stream name, and a proof
+    that the shipper holds the key. WHY: nothing is revealed or stored for a client that cannot prove it."""
 
     RECORD = 2
     """WHAT: shipper to collector: one sealed log record. WHY: the actual log data."""
@@ -52,6 +55,14 @@ class MessageType(IntEnum):
 
     ERROR = 4
     """WHAT: collector to shipper: why it is closing the connection. WHY: a clear reason instead of a silent disconnect."""
+
+    CHALLENGE = 5
+    """WHAT: collector to shipper, the first frame of every connection: a fresh random nonce and a puzzle
+    difficulty. WHY: the nonce makes every handshake unique (no replays); the puzzle makes each attempt cost work."""
+
+    WELCOME = 6
+    """WHAT: collector to shipper, answering a good HELLO: where the stream's chain ends, and a proof that
+    the collector holds the key too. WHY: both sides are authenticated before any log data moves."""
 
 
 class ProtocolError(Exception):

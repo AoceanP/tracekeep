@@ -13,3 +13,5 @@ logs/
 key*.txt
 spool/
 *.state.json
+# test-only TLS keys (see tests/certs/README.txt) are meant to be committed
+!tests/certs/*.key

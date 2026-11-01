@@ -50,6 +50,7 @@ To understand integrity protection and protocol design from the ground up, the p
 | Path traversal prevention for names that come from the network | `storage.py` |
 | A threaded TCP server with per-stream locking | `collector.py` |
 | Testing networked code with real sockets on localhost | `tests/test_network.py` |
+| Mutual authentication with nonces, proof-of-work puzzles, admission control, TLS 1.3 | `handshake.py`, `admission.py`, `tls.py` |
 | Store and forward: write-ahead spooling, fsync, atomic state files, resuming without duplicates | `tracekeep/spool.py`, `SpoolingShipper` |
 
 ### Part of a project series
@@ -87,7 +88,7 @@ No install step: everything runs with `python -m tracekeep` from this folder.
 python -m unittest discover -s tests -t .
 ```
 
-It ends with `Ran 59 tests ... OK`.
+It ends with `Ran 81 tests ... OK`.
 
 ### 4. Try the demo
 
@@ -184,16 +185,49 @@ On Windows a refused connection takes about **2 seconds** to fail (Windows retri
 
 | Type | Direction | Payload |
 |---|---|---|
-| `HELLO` (1) | shipper to collector, first frame | the stream name |
+| `CHALLENGE` (5) | collector to shipper, the first frame of every connection | a fresh random nonce (32 B) and the puzzle difficulty in bits (1 B) |
+| `HELLO` (1) | shipper to collector | its own nonce (32 B), the puzzle solution (8 B), a proof it holds the key (32 B), the stream name |
+| `WELCOME` (6) | collector to shipper | next expected sequence (8 B), last hash (32 B), and the collector's own proof of the key (32 B) |
 | `RECORD` (2) | shipper to collector | sequence (8 B), time in ms (8 B), previous hash (32 B), MAC (32 B), message (UTF-8, up to 8 KiB) |
 | `ACK` (3) | collector to shipper | next expected sequence (8 B) and last hash (32 B) |
 | `ERROR` (4) | collector to shipper | the reason, then the connection closes |
 
+The proofs are `HMAC-SHA256(key, label ‖ both nonces ‖ ...)`: the shipper's covers the stream name, the collector's covers the chain end it reports. Each label is different, so no proof can be reused for another purpose.
+
 Each record's hash is `SHA-256(prev ‖ seq ‖ time ‖ message)` and its MAC is `HMAC-SHA256(key, hash)`. Fixed-size fields come first and the message last, so two different records can never hash the same bytes.
+
+## Defences against automated attacks (protocol version 2)
+
+Automated attackers, including AI-driven ones, are cheap, fast and patient: they try every port, guess keys without tiring, hold connections open, and throw junk at parsers. Version 1 had no answer to that: anyone who could connect was told how long a stream was, and could hold a thread open for 30 seconds. Version 2 makes every attempt cost the attacker, and repeated failure cost more.
+
+| Attack | Defence | Where |
+|---|---|---|
+| Connecting just to learn about the logs | Nothing is revealed until the shipper proves it holds the key. An unauthenticated client gets one CHALLENGE (a random number) and nothing else. | `handshake.py` |
+| Pretending to be the collector | The collector proves it holds the key too (the WELCOME proof). The shipper refuses an impostor before sending any record. | `handshake.py` |
+| Replaying a recorded handshake | Both sides add a fresh random nonce to every handshake, so a recording never matches a new connection. | `handshake.py` |
+| Guessing the key again and again | Every attempt needs a small proof-of-work puzzle (normally about 256 hashes, unnoticeable). Each failure from an address makes its next puzzle 4x harder, up to about 4 million hashes. After 20 failures in 10 minutes the address is refused outright until the window passes. Checking a solution costs the collector one hash. | `admission.py` |
+| Opening thousands of connections | At most 64 connections in total and 8 per address. Extra ones are closed at once with no reply, so they never get a thread. Puzzles get harder for everyone while the collector is over three quarters full. | `admission.py` |
+| Connecting and stalling | The handshake must finish within 5 seconds, plus time to solve the puzzle. A stall is cut off, told why, and counted as a failure. | `collector.py` |
+| Flooding from forged addresses | The failure table holds at most 10,000 addresses and forgets the least recent, so the defence cannot be used to fill memory. | `admission.py` |
+| Reading the logs on the wire | Optional TLS 1.3 encrypts everything, handshake included. With client certificates required (mutual TLS), a client without one never even sees the CHALLENGE. | `tls.py` |
+| Junk aimed at the parser | Every header is checked before its payload is read, sizes are capped, and anything unexpected closes the connection. A fuzz test sends 200 random messages and checks the collector still serves a real shipper. | `protocol.py`, `test_hardening.py` |
+
+**One design point found by testing:** a punished address gets puzzles of up to 22 bits, about 2.4 s of work on this PC. The first version kept a fixed 1-second handshake deadline, which meant a real shipper on that address could *never* finish in time. The deadline now grows with the puzzle (assuming a machine 7 times slower), so stalling is still cut off but honest work always fits.
+
+**What this does not do:** it cannot tell an AI from a person by its packets, and nothing at this level can. It makes automation expensive, gives nothing away for free, and keeps the evidence of every failure.
+
+### Running it with TLS
+
+```
+tracekeep collect --tls-cert server.pem --tls-key server.key --tls-client-ca ca.pem
+tracekeep ship app.log --stream web01 --tls-ca ca.pem --tls-cert client.pem --tls-key client.key --tls-name localhost
+```
+
+`--tls-client-ca` (collector) and `--tls-cert`/`--tls-key` (shipper) are optional; without them TLS still encrypts, but any client may try the handshake. `--max-connections` and `--per-source` change the connection limits. The certificates in `tests/certs` are **test-only**: their private keys are public, so they protect nothing.
 
 ## Privacy and security
 
-- **Integrity, not secrecy:** tracekeep proves logs were not changed; it does **not** encrypt them. Anyone who can see the traffic can read the log lines (wiresight shows them). For logs over a real network, add TLS: see the roadmap.
+- **Integrity always, secrecy with TLS:** the chain proves logs were not changed. Without `--tls-cert`, anyone who can see the traffic can read the log lines (wiresight shows them), so use TLS for logs over a real network.
 - **The key is everything:** anyone with the key can write valid records. It is read from an environment variable or a file, never from the command line (where other users can see it) and never printed. The demo's key is public and only for the demo.
 - **The spool is on the shipper's disk:** waiting records are sealed, so changes to them are caught, but they are not encrypted, and a spool can be deleted by anyone who can delete the original log. Protect the spool folder like the log it holds.
 - **Local by default:** the collector listens on `127.0.0.1`, so it is not reachable from the network unless you pass `--host` on purpose.
@@ -217,7 +251,7 @@ Both diagrams are drawn in draw.io: [tracekeep-protocol.drawio](docs/tracekeep-p
 
 ## Tests
 
-59 tests with Python's built-in `unittest`, run with `python -m unittest discover -s tests -t .`. The network tests start a real collector on `127.0.0.1` on a free port, in a temporary folder that is deleted afterwards.
+81 tests with Python's built-in `unittest`, run with `python -m unittest discover -s tests -t .`. The network tests start a real collector on `127.0.0.1` on a free port, in a temporary folder that is deleted afterwards.
 
 | File | What it covers |
 |---|---|
@@ -225,13 +259,15 @@ Both diagrams are drawn in draw.io: [tracekeep-protocol.drawio](docs/tracekeep-p
 | `test_chain.py` | edits, deletions, swaps, duplicates, forged and rebuilt chains, the wrong key, payload checks |
 | `test_network.py` | shipping, reconnecting, separate streams, wrong keys, replays, path traversal, garbage, half frames |
 | `test_storage_and_cli.py` | the file format, stream names, the demo, exit codes, missing keys, files and collectors |
+| `test_hardening.py` | the handshake (puzzles and proofs bound to their nonces and stream), admission limits with a fake clock, and live attacks on a real collector: stalling, connection floods, repeated wrong keys up to a ban, a replayed handshake, an impostor collector, 200 random messages, and TLS with and without certificates |
 | `test_spool.py` | store and forward against a collector that is really stopped and restarted: outages, restarts of either side, a crash between an ACK and clearing the spool, a conflicting chain, a spool edited on disk, a full spool, the retry interval |
 
 ## Roadmap
 
 - [x] Binary protocol, hash chain with HMAC, collector, shipper, offline verify
 - [x] Store and forward: keep shipping through collector outages
-- [ ] TLS, so log lines are also kept secret on the network
+- [x] Protocol version 2: authenticated handshake both ways, adaptive puzzle, connection limits, bans
+- [x] TLS 1.3, optionally with client certificates
 - [ ] Anchor the latest hash automatically (e.g. to a second collector), to detect a truncated end
 - [ ] Key rotation, with the key's ID stored in each record
 - [ ] Ship Windows events straight from logonwatch's JSON-lines output

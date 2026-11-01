@@ -86,10 +86,11 @@ class ProtocolTests(unittest.TestCase):
         RETURN: nothing; fails if any is accepted
         """
         cases = {
-            "bad magic": b"XX" + bytes([1, 2]) + (0).to_bytes(4, "big"),
-            "version 2": b"TK" + bytes([2, 2]) + (0).to_bytes(4, "big"),
-            "type 99": b"TK" + bytes([1, 99]) + (0).to_bytes(4, "big"),
-            "4 GiB": b"TK" + bytes([1, 2]) + (2**32 - 1).to_bytes(4, "big"),
+            "bad magic": b"XX" + bytes([2, 2]) + (0).to_bytes(4, "big"),
+            "old version 1": b"TK" + bytes([1, 2]) + (0).to_bytes(4, "big"),
+            "future version 3": b"TK" + bytes([3, 2]) + (0).to_bytes(4, "big"),
+            "type 99": b"TK" + bytes([2, 99]) + (0).to_bytes(4, "big"),
+            "4 GiB": b"TK" + bytes([2, 2]) + (2**32 - 1).to_bytes(4, "big"),
         }
         for name, header in cases.items():
             with self.subTest(name), self.assertRaises(ProtocolError):
