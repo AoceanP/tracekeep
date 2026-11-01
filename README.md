@@ -64,7 +64,9 @@ Each project looks at the same network from a different side:
 | [**logonwatch**](https://github.com/AoceanP/logonwatch) | C# / .NET 10 | the defender's view | Is someone trying to break in, and did they get in? |
 | **tracekeep** (this one) | Python | the evidence's view | Can the logs still be trusted afterwards? |
 
-logonwatch finds the attack in the logs; tracekeep makes sure nobody can quietly rewrite those logs afterwards. And because tracekeep sends a documented protocol over plain TCP, wiresight can capture it on the loopback adapter and show every HELLO, RECORD and ACK.
+logonwatch finds the attack in the logs; tracekeep makes sure nobody can quietly rewrite those logs afterwards. And because tracekeep sends a documented protocol over plain TCP, wiresight can capture it on the loopback adapter and show every CHALLENGE, HELLO, WELCOME, RECORD and ACK (unless TLS is on, which is the point of TLS).
+
+**The common thread: patient, automated attackers.** Automated attackers, including AI-driven ones, are cheap, fast and patient, so each tool answers them in its own layer. portscout shows that a rate limit makes a scan polite, not invisible. wiresight catches fast and slow scans and sweeps, and caps its own memory against SYN floods. logonwatch catches slow password guessing and spraying spread over a day. tracekeep's protocol makes every connection prove the key and solve a puzzle that gets harder after each failure. [The series overview](https://github.com/AoceanP) has the whole story.
 
 ## Setup
 
